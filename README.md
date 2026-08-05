@@ -11,21 +11,30 @@ free tier, with state persisted by committing back to the repo).
 
 ## Data coverage — what's actually live vs. best-effort
 
-| Store | Fully live-scraped (HTML) | OCR-derived (image/PDF leaflets) | App-only / not collected |
-|---|---|---|---|
-| 7-Eleven | Promotion cards with text prices | Weekly banner images (`.promo-banner`) | "7-Delivery" coupons & All Member app-exclusive flash deals |
-| CJ More | Catalog title/date metadata | **Primary path** — per-item prices only exist inside catalog leaflet images | none identified |
-| Lotus's | "Weekend Shock Price" page | Weekly e-leaflet pages | "Lotus's Reward" personalized member coupons |
-| Makro | Public discount listing | not used currently | Makro PRO app wholesale/member pricing (device-signed session, not reachable from the web) |
-| Tops & Gourmet Market | Weekly promotions listing | not used currently | none identified |
+Verified against the real live sites (not assumed) as of the last scraper
+rewrite. Numbers are from an actual unauthenticated run with no
+`GEMINI_API_KEY` set (i.e. worst case — OCR items still get real
+titles/images/dates, just null prices until a Gemini key is added):
 
-Every scraper module's docstring restates this so it stays next to the code
-it describes — check there first if a store's coverage changes.
+| Store | Real-world status | Notes |
+|---|---|---|
+| 7-Eleven | **Live** — 16 items/run | Promotion payload is embedded as JSON in the page's `__NEXT_DATA__` script tag. Items with real `price`/`normal_price` (e.g. "ลดอย่างแรง 7 วันเท่านั้น", 59→49 THB) need **no OCR at all**. Items with only a banner image go through OCR. "7-Delivery" coupons & in-app-only All Member flash deals are app-only, not collected. |
+| Lotus's | **Live** — 40 items/run | The `/en/weekend-shock-price` URL used in an earlier version of this project **does not exist** (confirmed via the site's own JSON: `{"status":{"code":404}}`) — Lotus's is a client-rendered Next.js app and almost all inner routes return that same 404-in-JSON shell to a plain HTTP client. The one page that *is* server-rendered is the **homepage**, which embeds real `marketingBanner` campaign blocks (title, CDN image, link, schedule) — this scraper uses those, OCR'd for price. "Lotus's Reward" member coupons are app-only. |
+| Makro | **Live** — 3 items/run | `/en/discount` is server-rendered HTML, but its actual weekly deals are an image carousel (`.pro-week-item img.lazyload`), not text — title and validity period are parsed from the image `alt` text directly (no OCR needed for those two fields), price is OCR'd from the banner. Makro PRO app wholesale/member pricing is app-only (device-signed session). |
+| CJ More | **Blocked in practice** — 0 items/run | The correct domain is `www.cjmore.co.th` (`.com` is an unrelated expired/parked domain — verify a store's real domain before trusting old assumptions). The real site calls a same-origin JSON endpoint (`/promotion/type/{id}`) that this scraper calls directly, but `www.cjmore.co.th` currently rejects Python's TLS handshake outright (`TLSV1_ALERT_PROTOCOL_VERSION`) while plain `curl` to the identical URL succeeds — almost certainly TLS/JA3 fingerprinting by their edge/WAF. This project does not attempt to spoof a TLS fingerprint to bypass that. Separately, even a successful request currently returns thin data (one tab 500s, the other is stale from 2019) — CJ More's own backend needs to improve before this store yields real deals. |
+| Tops & Gourmet Market | **Blocked** — 0 items/run | The entire `www.tops.co.th` domain — not just the promotions path — returns HTTP 403 from Cloudflare bot management before any HTML is served, verified via response headers (`server: cloudflare`, `__cf_bm` cookie). This is not an app-only exclusion; the content is public, it's just behind anti-bot protection this project deliberately does not attempt to evade (no headless browser / stealth fingerprinting). |
+
+Every scraper module's docstring has the full detail behind each of these
+findings (URLs tried, JSON shapes, exact error strings) — check there first
+if a store's real-world behavior changes; this table is a summary, the
+docstring is the source of truth.
 
 OCR extraction is skipped entirely (item stored with `null` prices, logged,
 no crash) whenever `GEMINI_API_KEY` isn't set or the daily/per-run quota is
 exhausted. This is the expected steady state for anyone who doesn't want to
-create a Gemini API key — everything else in the pipeline still works.
+create a Gemini API key — every store above still returns real titles,
+images, links, and (where available) validity dates without it; only the
+price fields depend on OCR being configured.
 
 ## Repository layout
 

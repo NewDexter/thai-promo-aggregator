@@ -53,7 +53,7 @@ def build_scrapers(ocr: OcrFallback) -> list[BaseScraper]:
         SevenElevenScraper(ocr=ocr),
         CjMoreScraper(ocr=ocr),
         LotussScraper(ocr=ocr),
-        MakroScraper(),
+        MakroScraper(ocr=ocr),
         TopsGourmetScraper(),
     ]
 

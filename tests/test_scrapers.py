@@ -2,6 +2,10 @@
 Tests run entirely against local fixtures — no live network calls — so CI
 is deterministic. HTTP-fetching methods on BaseScraper are monkeypatched to
 return fixture content instead of hitting the network.
+
+Fixtures reflect the REAL structure of each store's live site as verified
+by direct inspection (see each scraper's module docstring for what was
+found and why), not placeholder guesses.
 """
 
 from __future__ import annotations
@@ -45,6 +49,17 @@ def _patch_fetch_bytes(monkeypatch: pytest.MonkeyPatch, scraper: Any) -> None:
     monkeypatch.setattr(scraper, "fetch_bytes", fake_fetch_bytes)
 
 
+def _clear_gemini_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure OCR is unconfigured so tests exercise graceful degradation
+    deterministically, regardless of the local/CI environment."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    import importlib
+
+    import config as config_module
+
+    importlib.reload(config_module)
+
+
 # ---------------------------------------------------------------------------
 # base_scraper helpers
 # ---------------------------------------------------------------------------
@@ -83,31 +98,150 @@ def test_hash_id_stable_for_identical_input() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Makro (pure HTML, no OCR)
+# 7-Eleven: real __NEXT_DATA__ JSON structure
 # ---------------------------------------------------------------------------
 
 
-def test_makro_scraper_parses_html_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_seven_eleven_parses_structured_price_from_next_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Items with real price/normal_price in the JSON need no OCR at all."""
+    scraper = SevenElevenScraper()
+    html = (FIXTURES / "seven_eleven_promotion.html").read_text()
+    _patch_fetch(monkeypatch, scraper, {"https://www.7eleven.co.th/promotion": html})
+    _patch_fetch_bytes(monkeypatch, scraper)
+
+    deals = scraper.scrape()
+
+    html_deals = [d for d in deals if d["extraction_method"] == "html"]
+    assert len(html_deals) == 1
+    deal = html_deals[0]
+    assert deal["title"] == "ลดอย่างแรง 7 วันเท่านั้น"
+    assert deal["sale_price"] == 49.0
+    assert deal["original_price"] == 59.0
+    assert deal["valid_until"] == "2026-08-31"
+    assert deal["source_url"] == "https://www.7eleven.co.th/promotion/sale/269"
+    assert deal["category"] == "Discount"
+
+
+def test_seven_eleven_ocr_fallback_for_priceless_items_with_banner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Items with no price but a banner_image go through OCR; without an
+    API key configured this degrades to null prices, not a crash."""
+    _clear_gemini_key(monkeypatch)
+
+    scraper = SevenElevenScraper()
+    html = (FIXTURES / "seven_eleven_promotion.html").read_text()
+    _patch_fetch(monkeypatch, scraper, {"https://www.7eleven.co.th/promotion": html})
+    _patch_fetch_bytes(monkeypatch, scraper)
+
+    deals = scraper.scrape()
+
+    ocr_deals = [d for d in deals if d["extraction_method"] == "ocr"]
+    assert len(ocr_deals) == 1
+    assert ocr_deals[0]["title"] == "Shop and Get Cashback Mission"
+    assert ocr_deals[0]["category"] == "MemberExclusive"
+    assert ocr_deals[0]["sale_price"] is None
+    assert ocr_deals[0]["original_price"] is None
+
+
+def test_seven_eleven_missing_next_data_returns_empty_not_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    scraper = SevenElevenScraper()
+    _patch_fetch(monkeypatch, scraper, {"https://www.7eleven.co.th/promotion": "<html><body>no data here</body></html>"})
+
+    deals = scraper.scrape()
+
+    assert deals == []
+
+
+# ---------------------------------------------------------------------------
+# CJ More: real cjmore.co.th AJAX JSON endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_cj_more_ocr_from_leaflet_images(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_gemini_key(monkeypatch)
+
+    scraper = CjMoreScraper()
+    tab1 = (FIXTURES / "cj_more_type1.json").read_text()
+    tab2 = (FIXTURES / "cj_more_type2_empty.json").read_text()
+    _patch_fetch(
+        monkeypatch,
+        scraper,
+        {
+            "https://www.cjmore.co.th/promotion/type/1": tab1,
+            "https://www.cjmore.co.th/promotion/type/2": tab2,
+        },
+    )
+    _patch_fetch_bytes(monkeypatch, scraper)
+
+    deals = scraper.scrape()
+
+    # Tab 1 has 2 leaflet images, tab 2 has none.
+    assert len(deals) == 2
+    assert all(d["extraction_method"] == "ocr" for d in deals)
+    assert all(d["sale_price"] is None for d in deals)  # graceful degradation, no API key
+    assert deals[0]["image_url"] == "https://www.cjmore.co.th/upload/promotion/195.jpg"
+
+
+def test_cj_more_handles_backend_500_gracefully(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CJ More's own tab-2 endpoint is known to sometimes 500 — this must
+    not crash the scraper or the orchestrator."""
+    scraper = CjMoreScraper()
+
+    def fake_fetch(url: str, **kwargs: Any) -> FakeResponse:
+        if url.endswith("/type/1"):
+            return FakeResponse((FIXTURES / "cj_more_type1.json").read_text())
+        raise RuntimeError("simulated 500 from CJ More backend")
+
+    monkeypatch.setattr(scraper, "fetch", fake_fetch)
+    _patch_fetch_bytes(monkeypatch, scraper)
+    _clear_gemini_key(monkeypatch)
+
+    deals = scraper.scrape()
+
+    assert len(deals) == 2  # tab 1 still succeeds despite tab 2 failing
+
+
+def test_cj_more_non_json_response_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    scraper = CjMoreScraper()
+    _patch_fetch(
+        monkeypatch,
+        scraper,
+        {
+            "https://www.cjmore.co.th/promotion/type/1": "<html>Whoops</html>",
+            "https://www.cjmore.co.th/promotion/type/2": "<html>Whoops</html>",
+        },
+    )
+
+    deals = scraper.scrape()
+
+    assert deals == []
+
+
+# ---------------------------------------------------------------------------
+# Makro: real image-carousel + OCR
+# ---------------------------------------------------------------------------
+
+
+def test_makro_parses_banner_title_and_period_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_gemini_key(monkeypatch)
+
     scraper = MakroScraper()
     html = (FIXTURES / "makro_discount.html").read_text()
     _patch_fetch(monkeypatch, scraper, {"https://www.makro.co.th/en/discount": html})
+    _patch_fetch_bytes(monkeypatch, scraper)
 
     deals = scraper.scrape()
 
     assert len(deals) == 2
-    shrimp = deals[0]
-    assert shrimp["title"] == "Frozen Shrimp 1kg (Box of 12)"
-    assert shrimp["category"] == "MemberExclusive"
-    assert shrimp["original_price"] == 1290.00
-    assert shrimp["sale_price"] == 990.00
-    assert shrimp["valid_until"] == "2026-08-15"
-    assert shrimp["extraction_method"] == "html"
-    assert shrimp["store"] == "Makro"
-    assert len(shrimp["hash_id"]) == 32
+    assert deals[0]["title"] == "FF Weekly17 Period : 5Aug - 11Aug'26"
+    assert deals[0]["valid_until"] == "2026-08-11"
+    assert deals[0]["extraction_method"] == "ocr"
+    assert deals[0]["sale_price"] is None  # graceful degradation, no API key
+    assert deals[1]["valid_until"] == "2026-08-18"
 
 
 # ---------------------------------------------------------------------------
-# Tops & Gourmet Market (pure HTML, no OCR)
+# Tops & Gourmet Market (pure HTML, no OCR) — unaffected by the real-site
+# Cloudflare block, which is an operational/runtime issue, not a parsing bug.
 # ---------------------------------------------------------------------------
 
 
@@ -128,116 +262,40 @@ def test_tops_scraper_parses_html_fixture(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 # ---------------------------------------------------------------------------
-# 7-Eleven (HTML cards + OCR banner, graceful degradation without API key)
+# Lotus's: real homepage marketingBanner blocks + CSR-only graceful degradation
 # ---------------------------------------------------------------------------
 
 
-def test_seven_eleven_html_cards(monkeypatch: pytest.MonkeyPatch) -> None:
-    scraper = SevenElevenScraper()
-    html = (FIXTURES / "seven_eleven_promotion.html").read_text()
-    _patch_fetch(monkeypatch, scraper, {"https://www.7eleven.co.th/promotion": html})
-    _patch_fetch_bytes(monkeypatch, scraper)
+def test_lotuss_extracts_marketing_banners(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_gemini_key(monkeypatch)
 
-    deals = scraper.scrape()
-
-    html_deals = [d for d in deals if d["extraction_method"] == "html"]
-    assert len(html_deals) == 2
-    assert html_deals[0]["title"] == "Sandwich Ham & Cheese"
-    assert html_deals[0]["category"] == "Buy1Get1"
-    assert html_deals[0]["original_price"] == 45.0
-    assert html_deals[0]["sale_price"] == 25.0
-    assert html_deals[0]["valid_until"] == "2026-12-31"
-
-
-def test_seven_eleven_ocr_graceful_degradation_without_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without GEMINI_API_KEY set, the banner should still be recorded, with
-    null prices, and the run must not crash."""
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    # Reload config so CONFIG.ocr.is_configured reflects the cleared env var.
-    import importlib
-
-    import config as config_module
-
-    importlib.reload(config_module)
-
-    scraper = SevenElevenScraper()
-    html = (FIXTURES / "seven_eleven_promotion.html").read_text()
-    _patch_fetch(monkeypatch, scraper, {"https://www.7eleven.co.th/promotion": html})
-    _patch_fetch_bytes(monkeypatch, scraper)
-
-    deals = scraper.scrape()
-
-    ocr_deals = [d for d in deals if d["extraction_method"] == "ocr"]
-    assert len(ocr_deals) == 1
-    assert ocr_deals[0]["sale_price"] is None
-    assert ocr_deals[0]["original_price"] is None
-    assert ocr_deals[0]["title"] == "Weekly Snack Deals Banner"
-
-
-# ---------------------------------------------------------------------------
-# CJ More (OCR-primary, graceful degradation)
-# ---------------------------------------------------------------------------
-
-
-def test_cj_more_ocr_graceful_degradation(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    import importlib
-
-    import config as config_module
-
-    importlib.reload(config_module)
-
-    scraper = CjMoreScraper()
-    html = (FIXTURES / "cj_more_promotion.html").read_text()
-    _patch_fetch(monkeypatch, scraper, {"https://www.cjmore.com/promotion": html})
+    scraper = LotussScraper()
+    html = (FIXTURES / "lotuss_homepage.html").read_text()
+    _patch_fetch(monkeypatch, scraper, {"https://www.lotuss.com/en": html})
     _patch_fetch_bytes(monkeypatch, scraper)
 
     deals = scraper.scrape()
 
     assert len(deals) == 1
-    assert deals[0]["extraction_method"] == "ocr"
-    assert deals[0]["sale_price"] is None
-    assert deals[0]["valid_until"] == "2026-08-07"
+    deal = deals[0]
+    assert deal["title"] == "Big Bang 21may 12aug"  # slug-derived fallback (no OCR key)
+    assert deal["source_url"] == "https://www.lotuss.com/th/promotion/big-bang-21may-12aug"
+    assert deal["valid_until"] == "2026-08-12"
+    assert deal["extraction_method"] == "ocr"
+    assert deal["sale_price"] is None  # graceful degradation, no API key
 
 
-# ---------------------------------------------------------------------------
-# Lotus's (HTML Weekend Shock Price + OCR leaflet)
-# ---------------------------------------------------------------------------
-
-
-def test_lotuss_weekend_shock_html(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    import importlib
-
-    import config as config_module
-
-    importlib.reload(config_module)
-
+def test_lotuss_csr_only_page_degrades_to_empty_not_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Confirms the documented reality: many Lotus's routes are CSR-only
+    and report 404 inside their own JSON payload. The scraper must return
+    an empty list quietly, not raise."""
     scraper = LotussScraper()
-    shock_html = (FIXTURES / "lotuss_weekend_shock.html").read_text()
-    leaflet_html = (FIXTURES / "lotuss_leaflet.html").read_text()
-    _patch_fetch(
-        monkeypatch,
-        scraper,
-        {
-            "https://www.lotuss.com/en/weekend-shock-price": shock_html,
-            "https://www.lotuss.com/en/promotions/leaflet": leaflet_html,
-        },
-    )
-    _patch_fetch_bytes(monkeypatch, scraper)
+    html = (FIXTURES / "lotuss_csr_404.html").read_text()
+    _patch_fetch(monkeypatch, scraper, {"https://www.lotuss.com/en": html})
 
     deals = scraper.scrape()
 
-    html_deals = [d for d in deals if d["extraction_method"] == "html"]
-    ocr_deals = [d for d in deals if d["extraction_method"] == "ocr"]
-
-    assert len(html_deals) == 2
-    assert html_deals[0]["title"] == "Fresh Chicken Breast 500g"
-    assert html_deals[0]["category"] == "FlashSale"
-    assert html_deals[0]["sale_price"] == 59.0
-
-    assert len(ocr_deals) == 1
-    assert ocr_deals[0]["sale_price"] is None  # graceful degradation, no API key
+    assert deals == []
 
 
 # ---------------------------------------------------------------------------

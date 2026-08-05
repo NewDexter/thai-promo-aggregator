@@ -1,33 +1,63 @@
 """
 Lotus's (formerly Tesco Lotus) scraper.
 
-Coverage notes (read before modifying):
-  * HTML path:  The "Weekend Shock Price" (ล็อตเต้ ช็อคราคา / ราคาช็อกโลก
-    เฉพาะวันเสาร์-อาทิตย์) page renders each item as a structured HTML
-    product tile with title and price text — scraped directly, no OCR.
-  * OCR path:   The broader weekly e-leaflet ("ใบปลิวโปรโมชั่น") is
-    published as a multi-page image gallery / PDF with no per-item HTML
-    text. Each leaflet page image is routed through
-    `ocr_fallback.OcrFallback`.
+Coverage notes (read before modifying — confirmed by direct inspection of
+the live site, not assumed):
+  * A dedicated "Weekend Shock Price" URL does NOT exist on the current
+    site (an earlier version of this scraper guessed
+    `/en/weekend-shock-price`; the site's own Next.js payload reports that
+    path as a 404). Lotus's is a fully client-rendered Next.js storefront
+    — most inner pages return only `{"page": {"status": {"code": 404}}}`
+    when requested with a plain HTTP GET, i.e. there is no static HTML/JSON
+    to scrape for them without executing JavaScript, which this project
+    intentionally does not do (no headless browser — stays zero-cost/
+    low-resource).
+  * HTML path (primary, verified working): the homepage
+    (www.lotuss.com/en) IS server-rendered with a real CMS payload in
+    `__NEXT_DATA__` → `props.pageProps.page.data.content`, a list of
+    content blocks. Blocks of type `marketingBanner` are the real weekly
+    promotional campaign banners (e.g. "Big Bang" coupon campaigns, "My
+    Lotus's Fest") with real CDN image URLs and links — this is the
+    genuine public equivalent of a "weekly e-leaflet" for this store.
+  * OCR path: marketing banners carry no text field, only an image — every
+    banner is routed through `ocr_fallback.OcrFallback` to recover a
+    title/price. A slug-derived fallback title (from the banner's link)
+    is used if OCR is unavailable/exhausted, per the project's
+    graceful-degradation rule.
   * OUT OF SCOPE (app-only): "Lotus's Reward" personalized member coupons
     require app login and per-user session tokens; not reachable from the
-    public web and therefore not collected here.
+    public web and therefore not collected here. Category/product-listing
+    pages (e.g. `/th/category/weekly-promotion`) exist but require walking
+    a large per-product catalog API — out of scope for a promotions
+    aggregator; revisit only if `marketingBanner` coverage proves
+    insufficient.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any
-
-from bs4 import BeautifulSoup
 
 from ocr_fallback import OcrFallback
 from scrapers.base_scraper import BaseScraper
 
 logger = logging.getLogger(__name__)
 
-WEEKEND_SHOCK_URL = "https://www.lotuss.com/en/weekend-shock-price"
-LEAFLET_URL = "https://www.lotuss.com/en/promotions/leaflet"
+HOMEPAGE_URL = "https://www.lotuss.com/en"
+
+_NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+
+
+def _slug_to_title(url: str | None) -> str:
+    """Derive a readable fallback title from a promo URL slug, e.g.
+    '.../promotion/big-bang-21may-12aug' -> 'Big Bang 21May 12aug'."""
+    if not url:
+        return "Lotus's Promotion"
+    slug = url.rstrip("/").rsplit("/", 1)[-1]
+    words = [w for w in slug.replace("-", " ").replace("_", " ").split() if w]
+    return " ".join(w.capitalize() for w in words) or "Lotus's Promotion"
 
 
 class LotussScraper(BaseScraper):
@@ -38,104 +68,105 @@ class LotussScraper(BaseScraper):
         self._ocr = ocr or OcrFallback()
 
     def scrape(self) -> list[dict[str, Any]]:
-        deals: list[dict[str, Any]] = []
-        deals.extend(self._scrape_weekend_shock_price())
-        deals.extend(self._scrape_leaflet())
-        return deals
-
-    # -- Weekend Shock Price: structured HTML -----------------------------
-
-    def _scrape_weekend_shock_price(self) -> list[dict[str, Any]]:
-        deals: list[dict[str, Any]] = []
-        response = self.fetch(WEEKEND_SHOCK_URL)
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        for tile in soup.select(".product-tile"):
-            title_el = tile.select_one(".product-title")
-            if title_el is None:
-                continue
-            original_el = tile.select_one(".price-was")
-            sale_el = tile.select_one(".price-now")
-            valid_el = tile.select_one(".valid-until")
-
-            deals.append(
-                self.build_deal(
-                    title=title_el.get_text(strip=True),
-                    category="FlashSale",
-                    original_price=original_el.get_text(strip=True) if original_el else None,
-                    sale_price=sale_el.get_text(strip=True) if sale_el else None,
-                    valid_until=valid_el.get("data-iso-date") if valid_el else None,
-                    image_url=None,
-                    source_url=WEEKEND_SHOCK_URL,
-                    extraction_method="html",
-                )
+        response = self.fetch(HOMEPAGE_URL)
+        content_blocks = self._extract_content_blocks(response.text)
+        if not content_blocks:
+            logger.warning(
+                "[%s] no CMS content blocks found on homepage — page structure "
+                "may have changed, or this run hit the CSR-only 404 shell.",
+                self.store_name,
             )
+            return []
+
+        deals: list[dict[str, Any]] = []
+        for block in content_blocks:
+            marketing_banner = block.get("marketingBanner")
+            if not isinstance(marketing_banner, dict):
+                continue
+            for banner in marketing_banner.get("banners", []) or []:
+                deal = self._process_banner(banner)
+                if deal is not None:
+                    deals.append(deal)
         return deals
 
-    # -- Weekly e-leaflet: OCR path -----------------------------------
+    # -- JSON extraction -----------------------------------------------
 
-    def _scrape_leaflet(self) -> list[dict[str, Any]]:
-        deals: list[dict[str, Any]] = []
-        response = self.fetch(LEAFLET_URL)
-        soup = BeautifulSoup(response.text, "html.parser")
+    @staticmethod
+    def _extract_content_blocks(html: str) -> list[dict[str, Any]]:
+        match = _NEXT_DATA_RE.search(html)
+        if not match:
+            return []
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError as exc:
+            logger.warning("[Lotus's] failed to parse __NEXT_DATA__ JSON: %s", exc)
+            return []
+        page = data.get("props", {}).get("pageProps", {}).get("page", {})
+        if page.get("status", {}).get("code") != 200:
+            return []
+        content = page.get("data", {}).get("content")
+        return content if isinstance(content, list) else []
 
-        for page_img in soup.select("img.leaflet-page"):
-            image_url = page_img.get("src") or page_img.get("data-src")
-            if not image_url:
-                continue
-            if image_url.startswith("//"):
-                image_url = "https:" + image_url
-            elif image_url.startswith("/"):
-                image_url = "https://www.lotuss.com" + image_url
+    # -- per-banner deal construction ----------------------------------
 
-            try:
-                image_bytes = self.fetch_bytes(image_url)
-            except Exception as exc:  # noqa: BLE001 - one bad page shouldn't stop the run
-                logger.warning("[%s] failed to download leaflet page %s: %s", self.store_name, image_url, exc)
-                deals.append(
-                    self.build_deal(
-                        title="Lotus's Weekly Leaflet Page",
-                        category="Discount",
-                        original_price=None,
-                        sale_price=None,
-                        valid_until=None,
-                        image_url=image_url,
-                        source_url=LEAFLET_URL,
-                        extraction_method="ocr",
-                    )
-                )
-                continue
+    def _process_banner(self, banner: dict[str, Any]) -> dict[str, Any] | None:
+        banner_image = banner.get("bannerImage") or {}
+        image_url = banner_image.get("url")
+        if not image_url:
+            return None
+        # Lotus's CDN URLs sometimes contain literal spaces; encode for a valid request.
+        image_url = image_url.replace(" ", "%20")
 
-            ocr_results = self._ocr.extract_deals_from_image(
-                image_bytes, source_description=f"Lotus's leaflet {image_url}"
+        source_url = banner.get("bannerLink") or HOMEPAGE_URL
+        fallback_title = _slug_to_title(banner.get("bannerLink"))
+        schedule = banner.get("schedule") or {}
+        valid_until = self._date_only(schedule.get("endDateTime"))
+
+        try:
+            image_bytes = self.fetch_bytes(image_url)
+        except Exception as exc:  # noqa: BLE001 - one bad banner shouldn't stop the run
+            logger.warning("[%s] failed to download banner %s: %s", self.store_name, image_url, exc)
+            return self.build_deal(
+                title=fallback_title,
+                category="Discount",
+                original_price=None,
+                sale_price=None,
+                valid_until=valid_until,
+                image_url=image_url,
+                source_url=source_url,
+                extraction_method="ocr",
             )
 
-            if not ocr_results:
-                deals.append(
-                    self.build_deal(
-                        title="Lotus's Weekly Leaflet Page",
-                        category="Discount",
-                        original_price=None,
-                        sale_price=None,
-                        valid_until=None,
-                        image_url=image_url,
-                        source_url=LEAFLET_URL,
-                        extraction_method="ocr",
-                    )
-                )
-                continue
+        ocr_results = self._ocr.extract_deals_from_image(
+            image_bytes, source_description=f"Lotus's banner {image_url}"
+        )
 
-            for item in ocr_results:
-                deals.append(
-                    self.build_deal(
-                        title=item.get("title") or "Lotus's Weekly Leaflet Item",
-                        category="Discount",
-                        original_price=item.get("original_price"),
-                        sale_price=item.get("sale_price"),
-                        valid_until=item.get("valid_until"),
-                        image_url=image_url,
-                        source_url=LEAFLET_URL,
-                        extraction_method="ocr",
-                    )
-                )
-        return deals
+        if not ocr_results:
+            return self.build_deal(
+                title=fallback_title,
+                category="Discount",
+                original_price=None,
+                sale_price=None,
+                valid_until=valid_until,
+                image_url=image_url,
+                source_url=source_url,
+                extraction_method="ocr",
+            )
+
+        first = ocr_results[0]
+        return self.build_deal(
+            title=first.get("title") or fallback_title,
+            category="Discount",
+            original_price=first.get("original_price"),
+            sale_price=first.get("sale_price"),
+            valid_until=first.get("valid_until") or valid_until,
+            image_url=image_url,
+            source_url=source_url,
+            extraction_method="ocr",
+        )
+
+    @staticmethod
+    def _date_only(iso_datetime: str | None) -> str | None:
+        if not iso_datetime:
+            return None
+        return iso_datetime.split("T", 1)[0]
