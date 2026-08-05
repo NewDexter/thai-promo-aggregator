@@ -1,0 +1,53 @@
+name: Thai Promo Aggregator
+
+on:
+  schedule:
+    # Every 6 hours. GitHub Actions cron uses UTC.
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+# Prevent overlapping runs from racing on the committed SQLite DB / OCR cache.
+concurrency:
+  group: thai-promo-aggregator-run
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  scrape-and-notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run promotion aggregator
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python master_orchestrator.py
+
+      - name: Commit updated database + OCR cache back to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/deals.db cache/ocr/
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "chore: update deal state [skip ci]"
+            git push
+          fi
